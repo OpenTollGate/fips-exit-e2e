@@ -7,7 +7,7 @@
 **Domain:** `fips-exit.orangesync.tech` (live, nsite gateway)  
 **Dashboard:** `https://npub1laqt4pmrqsel4ak6z6nazptm99jj28m386zkmsgd9zadt7jq55jq9qfhhe.nsite.lol/`  
 **VPS:** 66.92.204.38 (VPS1, Debian 13, via tollgate-infrastructure-kit)  
-**FIPS Version:** v0.2.0 (pinned — NOT tracking master)  
+**FIPS Version:** v0.4.0 (pinned — NOT tracking master)  
 
 ---
 
@@ -43,7 +43,7 @@ internet via nftables MASQUERADE.
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Mesh protocol | FIPS v0.2.0 (pinned) | Nostr-native p2p mesh; pinned to stable release, NOT tracking master |
+| Mesh protocol | FIPS v0.4.0 (pinned) | Nostr-native p2p mesh; pinned to stable release, NOT tracking master |
 | Routing layer | nvpn 4.0.87 | FIPS alone handles mesh handshake but not egress routing; nvpn provides tunnel network (10.44.0.0/16) + WireGuard exit management |
 | Internet exit | WireGuard wg0 + nftables MASQUERADE | Simple, auditable, no dependencies on VPN providers |
 | Identity | Nostr npub (FIPS node identity) | Each FIPS node has a Nostr keypair; exit advertises via kind 30078 events |
@@ -55,15 +55,15 @@ internet via nftables MASQUERADE.
 
 | Field | Value |
 |-------|-------|
-| Pinned version | v0.2.0 (upstream tagged release) |
+| Pinned version | v0.4.0 (upstream tagged release) |
 | Tag author | Johnathan Corgan (jmcorgan/fips maintainer) |
-| Tag date | 2026-03-22 |
-| Pinned commit | `8151cc8d08fc98ffc17671b5a49a4d76ce504292` |
-| Local fork commit | `7a3f8c7ff3fb5d230a376cf1519b27f162fa442e` (v0.2.0 + 4 commits) |
+| Tag date | 2026-06-27 |
+| Pinned commit | `da2d0b7408fc98ffc17671b5a49a4d76ce504292` |
+| Local fork commit | `7a3f8c7ff3fb5d230a376cf1519b27f162fa442e` (v0.4.0 + 4 commits) |
 | VPS1 binary | `/usr/bin/fips` (17.6MB, built 2026-07-05 from local fork) |
 
 **Policy:** DO NOT follow master. Upstream is actively refactoring toward sans-io
-architecture. The v0.2.0 tag is the last stable release before the refactor.
+architecture. The v0.4.0 tag is the last stable release before the refactor.
 
 ---
 
@@ -71,7 +71,7 @@ architecture. The v0.2.0 tag is the last stable release before the refactor.
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| FIPS daemon | ✅ ACTIVE | v0.2.0-derivative, UDP :2121, TCP :8443, persistent identity |
+| FIPS daemon | ✅ ACTIVE | v0.4.0-derivative, UDP :2121, TCP :8443, persistent identity |
 | WireGuard wg0 | ✅ UP | :51821, 10.99.99.1/24, peer 10.99.99.2 |
 | nftables fips-exit | ✅ LOADED | MASQUERADE on wg0 → eth0 |
 | IP forwarding | ✅ ENABLED | net.ipv4.ip_forward=1, persistent via sysctl.d |
@@ -122,7 +122,7 @@ after VPS1 FIPS restarts).
 ### Verified Working
 
 - ✅ Config generated from environment variables
-- ✅ FIPS daemon starts (v0.2.0-derivative)
+- ✅ FIPS daemon starts (v0.4.0-derivative)
 - ✅ Transports initialized: UDP :2121 + TCP :8443
 - ✅ Connection to VPS1 established (1 peer)
 - ✅ FIPS handshake: "Connection promoted to active peer peer=vps1-exit"
@@ -286,6 +286,6 @@ Two projects were studied for reusable patterns:
 
 - **Maintainer:** c08r4d0r / @9cab90c7-125c-488a-b568-4a4bc0e9f627
 - **Contributors:** Amperstrand / @1624e1bb-94ef-46d1-b03b-f067ea320af9, Origami74
-- **Upstream FIPS:** jmcorgan (johnathan@corganlabs.com) — v0.2.0 pinned
+- **Upstream FIPS:** jmcorgan (johnathan@corganlabs.com) — v0.4.0 pinned
 - **VPS:** TollGate infrastructure (tollgate-infrastructure-kit)
 - **Relays:** relay1.orangesync.tech, ngit1.orangesync.tech, relay.damus.io, nos.lol

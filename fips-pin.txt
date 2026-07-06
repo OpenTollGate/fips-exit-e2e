@@ -1,0 +1,30 @@
+FIPS Version Pin
+================
+
+Pinned version: v0.4.0 (updated from v0.2.0)
+Tag author:     Johnathan Corgan <johnathan@corganlabs.com> (upstream maintainer)
+Tag date:       2026-06-27
+Pinned commit:  da2d0b74b05d7a2bafd67e05fcf7a6edf9afa5d7
+Upstream repo:  github.com/jmcorgan/fips
+
+Policy
+------
+- DO NOT track master — upstream is actively refactoring toward sans-io
+  architecture. Master may break the features we depend on.
+- v0.4.0 is the LATEST PRE-REFACTOR release from upstream. It is stable
+  and includes bugfixes over v0.2.0. v0.3.0+ introduced the Noise XX
+  handshake and version negotiation — v0.4.0 is the last release before
+  the sans-io rewrite.
+- Our local fork on ngit includes cherry-picked fixes on top.
+
+Local fork state (ngit)
+-----------------------
+Repo:  nostr://npub12m5exm2uk3xa674cc5r0hlyvccs5xxn7qv83ezuteefv5972nquq4j4szl/relay.ngit.dev/fips
+Local commit:   7a3f8c7ff3fb5d230a376cf1519b27f162fa442e
+Local branch:   feature/three-node-ota-antenna-validation
+Delta from tag: v0.2.0 + 4 commits (needs rebase to v0.4.0)
+
+VPS1 deployment
+---------------
+Currently running v0.2.0-derivative binary at /usr/bin/fips (17.6MB).
+Next rebuild will use v0.4.0 tag from upstream.
