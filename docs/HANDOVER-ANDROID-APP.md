@@ -1,244 +1,414 @@
-# Android FIPS App — Handover Document
+# Handover: Android FIPS Mesh Client App
 
-**Date:** 2026-07-06
-**Author:** Hermes Agent (on behalf of c08r4d0r)
-**Target reader:** LLM session tasked with building an Android app that runs FIPS and uses the FIPS exit node
-
----
-
-## 1. What Exists Today
-
-### The Exit Node (VPS1 — already deployed and working)
-
-A fully operational FIPS mesh exit node at IP **66.92.204.38** (Debian 13, tollgate-infrastructure-kit managed):
-
-| Component | Status | Details |
-|-----------|--------|---------|
-| FIPS daemon | ✅ ACTIVE | v0.4.0-derivative, UDP :2121, TCP :8443, persistent identity |
-| WireGuard wg0 | ✅ UP | :51821, 10.99.99.1/24, peer 10.99.99.2 active with recent handshake |
-| nftables fips-exit | ✅ LOADED | MASQUERADE on wg0 → eth0, **Cashu-gated** (paid_peers set, starts empty) |
-| IP forwarding | ✅ ENABLED | net.ipv4.ip_forward=1 |
-| FIPS external_addr | ✅ SET | 66.92.204.38:8443 |
-| Nostr route advert | ✅ ACTIVE | Kind 30078 published to multiple relays |
-| Nostr identity | npub1mqelkzqp4659fws35h2wvr7z9caka5ml8qddj3ssnwaulwpxdd9sdc3esw |
-
-**How the exit works (critical):**
-1. Peer connects to VPS1 FIPS daemon (UDP :2121 or TCP :8443)
-2. FIPS mesh handshake establishes encrypted session (Noise XK)
-3. FIPS daemon creates a TUN interface (fips0) with an IP in 10.44.0.0/16
-4. Kernel routes from fips0 → wg0 (WireGuard tunnel, 10.99.99.0/24)
-5. wg0 → nftables MASQUERADE → eth0 → internet
-6. **THE MASQUERADE IS GATED** — only IPs in the `paid_peers` nftables set get source NAT. Without payment, the peer has a tunnel but no internet (return traffic never comes back). See section 4 below.
-
-### The FIPS Protocol (v0.4.0, pinned)
-
-**CRITICAL: Do NOT use FIPS master branch.** The upstream (jmcorgan/fips) is actively refactoring toward a sans-io architecture. v0.4.0 (tagged 2026-06-27, commit `da2d0b74b05d7a2bafd67e05fcf7a6edf9afa5d7`) is the last stable pre-refactor release.
-
-FIPS v0.4.0 key properties:
-- Written in **Rust** using Tokio async runtime
-- Uses **Noise XK** handshake for encrypted peer connections
-- **Nostr-native identity** — each node has a Nostr nsec/npub keypair
-- **Peer discovery** via Nostr relay events (kind 30078 for route advertisements)
-- **Config YAML** has tun/dns/transports at root level (NOT nested under node:)
-- **TUN interface** created by the daemon for mesh traffic
-- **Transports**: UDP (primary, port 2121) and TCP (fallback, port 8443)
-- **Docker test image**: `fips-node:latest` built from `docker/Dockerfile.fips-node` — 231MB debian:trixie-slim runtime
-
-### Repo Structure
-
-**Primary repo:** `github.com/OpenTollGate/fips-exit-e2e`
-**Also on ngit:** `nostr://npub12m5exm2uk3xa674cc5r0hlyvccs5xxn7qv83ezuteefv5972nquq4j4szl/relay.ngit.dev/fips-exit-e2e`
-
-```
-fips-exit-e2e/
-├── docker/
-│   ├── Dockerfile.fips-node     # FIPS daemon container (debian:trixie-slim)
-│   └── entrypoint.sh            # Env-var → fips.yaml generator
-├── docker-compose.yml           # Test topology (fips-node + probe containers)
-├── scripts/
-│   ├── run-node.sh              # Run FIPS Docker node
-│   ├── build-fips.sh            # Build FIPS v0.4.0 from source
-│   ├── get-vps1-identity.sh     # SSH into VPS1, dump config + identity
-│   └── run-and-verify.sh        # Full run + verify script
-├── docs/
-│   ├── STATUS-AND-DESIGN.md     # Full architecture doc
-│   ├── PLAN.md                  # Phase 2/3 implementation plan
-│   └── HANDOVER-ANDROID-APP.md  # This file
-├── playwright.config.mjs        # Playwright config (video:'on', screenshot:'on')
-├── tests/                       # (empty — tests not yet written)
-├── fips-pin.txt                 # FIPS version pin details
-├── fips / fipsctl / fipstop     # FIPS v0.4.0 binaries (gitignored)
-└── .env                         # Test keypair, VPS1 config (gitignored)
-```
-
-**Upstream FIPS repo:** `github.com/jmcorgan/fips` — local clone at `~/fips/`
-
-### Test Peer Keypair (generated for e2e testing)
-
-Generated via `nak key generate`. The test peer successfully:
-- Connected to VPS1 via UDP :2121
-- Completed Noise XK handshake (Session established, initiator)
-- Was promoted to active peer (vps1-exit)
-- Switched parent mesh node to vps1-exit
-- Verified bidirectional traffic through the tunnel
+**Author:** c08r4d0r via Hermes Agent (Jul 2026)
+**Purpose:** Give a future LLM session everything it needs to build an Android app that runs the FIPS mesh protocol and uses the existing FIPS exit node as its internet gateway.
 
 ---
 
-## 2. What Worked ✅
+## 0. TL;DR — Which FIPS Branch to Use
 
-### FIPS Docker Node
-- `docker run --rm --name fips-test-node --network host --cap-add NET_ADMIN --device /dev/net/tun:/dev/net/tun -e FIPS_NSEC=... -e FIPS_PEER_NPUB=... -e FIPS_PEER_ADDR=66.92.204.38:2121 fips-node`
-- This **works reliably**. The entrypoint generates fips.yaml from env vars, starts the daemon, and it peers with VPS1 in ~5 seconds.
+**Use `ble-v2` branch from `jmcorgan/fips` upstream.**
 
-### FIPS Config Format
-- `tun:` / `dns:` / `transports:` at YAML root level (NOT nested under `node:`). This is the v0.4.0/v0.5.0-dev format.
-- `node:` section only contains: `identity`, `discovery.nostr.*`, and optional `discovery.stun.*`
-- `peers:` array at root level for static peer configuration (npub, alias, addresses, connect_policy)
+The `ble-v2` branch contains 11 commits by Origami74 (Arjen) that add Android
+support natively. It is based on v0.4.0 (`3ea7ca1`) and adds:
 
-### WireGuard + nftables MASQUERADE
-- Works perfectly for internet egress. Tested: node-a egresses via WG (5 ICMP packets), WG upstream ingress cannot reach node-b (security isolation works).
+- **`Node::enable_app_owned_tun()`** — app owns the TUN fd (Android VpnService), FIPS uses channels
+- **`AndroidBleBridge`** — Kotlin BLE radio byte-bridge (619 lines in `android_io.rs`)
+- **Platform gating** — desktop transports/TUN gated by `target_os`, compiles clean for Android
+- **BLE transport** — L2CAP CoC, per-peer PSM discovery, ~200/500 kbps up/down
 
-### Nostr Discovery
-- FIPS nodes discover each other via Nostr kind 30078 events published to relays
-- Relays used: relay1.orangesync.tech, relay2.orangesync.tech, ngit1.orangesync.tech, ngit2.orangesync.tech, relay.damus.io, nos.lol
-- VPS1 advertises via Nostr with `advertise: true` and `policy: configured_only`
-
-### FIPS v0.4.0 Binary Build
-- `cargo build --release -p fips` from tag v0.4.0 produces a 22.7MB binary
-- Build time: ~2 minutes on a modern machine
-- Also produces `fipsctl` and `fipstop` control tools
+**Branch commit:** `5606209` (HEAD of `upstream/ble-v2`, 2026-06-30)
+**Merge base with v0.4.0:** `3ea7ca1` (so it IS v0.4.0 + Android work on top)
 
 ---
 
-## 3. What Didn't Work / Problems Found ❌
+## 1. What You're Building
 
-### FIPS v0.2.0 (original pin)
-- **Too old.** Missing Noise XX handshake support, version negotiation, and bugfixes
-- Updated to v0.4.0 which is the last pre-refactor stable release
+An Android app that:
 
-### FIPS master (v0.5.0-dev)
-- **Do NOT use.** Upstream is mid-refactor. The sans-io changes are incomplete and may break features we depend on.
-- **Pinned to v0.4.0** — this is the hard rule.
-
-### Docker --network host requirement
-- The FIPS Docker container **MUST** use `--network host` because it creates a TUN interface (`/dev/net/tun`) inside the container. Bridge mode doesn't work because:
-  1. TUN devices need NET_ADMIN capability
-  2. The FIPS daemon binds to ports :2121 and :8443 on all interfaces
-  3. Bridge mode isolates the TUN device from the host network
-- **Not yet solved:** MACVLAN driver or port mapping with TUN passthrough was planned but never implemented. For an Android app, this is irrelevant since Android doesn't use Docker.
-
-### Test Container Exited with Code 137 (OOM killed)
-- The background test run (`proc_9d2830870696`) was killed by OOM with exit code 137
-- The container ran with `--rm` and `--network host` but was terminated mid-run. Likely resource pressure on the Hermes machine (not a code issue).
-- The container successfully connected and showed FIPS logs before being killed: it was the OOM killer, not a FIPS failure.
-
-### WireGuard Test Peer (nvpn, deprecated)
-- The original nostr-vpn Docker test peer (node-a) was buggy — it didn't reconnect after VPS1 FIPS restarts
-- **Replaced** with the raw FIPS Docker node (fips-raw-node:latest) which handles reconnection properly
-
-### Playwright Tests (not yet run)
-- The `playwright.config.mjs` is set up with `video: 'on'` and `screenshot: 'on'`
-- No test files (`*.spec.mjs`) exist in `tests/` yet
-- The dashboard was to be served at `fips-exit.orangesync.tech` but the nsite gateway only routes `*.nsite.orangesync.tech` — so the dashboard may not be accessible
-- **This is your job** — create Playwright tests for the Android app's happy path and show video evidence
+1. Runs the FIPS mesh protocol natively via JNI (Rust .so + Kotlin)
+2. Connects as a peer to the existing VPS1 exit node at `66.92.204.38:2121` (UDP) or `66.92.204.38:8443` (TCP)
+3. Optionally connects via BLE to nearby FIPS peers
+4. Routes device traffic through the FIPS mesh → exit node → WireGuard → internet
+5. Shows connection status, data counters, peer list, BLE scan results
 
 ---
 
-## 4. Key Architecture Details for Android
+## 2. What Exists Today
 
-### FIPS on Android — What Changes
+### Exit Node (VPS1 — 66.92.204.38)
 
-The Docker approach won't work on Android. You need to:
+A fully operational FIPS mesh exit node running on a Debian 13 VPS:
 
-**Option A: Cross-compile FIPS as a native Rust library**
-- FIPS v0.4.0 is pure Rust with Tokio async
-- Target: `aarch64-linux-android` (modern ARM devices) and `armv7-linux-androideabi` (older devices)
-- Needs: Android NDK, `rustup target add aarch64-linux-android`, cargo config for the NDK linker
-- The binary would run as a background service on Android
-- It needs `tun` device access — Android requires `VpnService` API, not direct TUN device access
-- **Recommended approach:** Use Android's `VpnService` to create a TUN interface, then bridge it to FIPS's TUN
+| Component | Detail |
+|-----------|--------|
+| **FIPS daemon** | v0.4.0-derivative (Rust binary, 17.6MB), running as systemd unit |
+| **Transports** | UDP :2121 (primary), TCP :8443 (fallback) |
+| **TUN interface** | `fips0`, MTU 1280 |
+| **WireGuard** | `wg0`, 10.99.99.1/24, peer at 10.99.99.2 |
+| **NAT** | nftables MASQUERADE from wg0 → eth0 |
+| **Identity** | `npub1mqelkzqp4659fws35h2wvr7z9caka5ml8qddj3ssnwaulwpxdd9sdc3esw` |
+| **Nostr relays** | relay1.orangesync.tech, relay2.orangesync.tech, ngit1.orangesync.tech, ngit2.orangesync.tech, relay.damus.io, nos.lol |
+| **Route advert** | Kind 30078 published to damus.io, nos.lol |
+| **External addr** | 66.92.204.38:8443 (TCP advertised) |
 
-**Option B: FIPS as a remote proxy**
-- Run FIPS on a companion device (ESP32, Raspberry Pi) that the phone connects to
-- Android just sends/receives traffic through it
-- Less integration work but defeats the purpose of running FIPS on the phone
+### FIPS Protocol
 
-**Key Android considerations:**
-1. **VpnService API**: Android's native way to route device traffic. FIPS creates a TUN interface internally; you'll need to either:
-   - Fork FIPS to accept a pre-created TUN fd (from VpnService) instead of creating its own
-   - OR wrap FIPS in a JNI layer where Rust's TUN creation is replaced with Android's VpnService fd
-2. **Background execution**: FIPS needs to run as a foreground service (with persistent notification) to avoid Android's Doze mode killing it
-3. **Nostr keys**: Each Android app instance generates its own nsec/npub. Store nsec in Android Keystore (hardware-backed if available).
-4. **Config YAML**: Generate from app settings rather than a file
+- **Language:** Rust
+- **Upstream:** `github.com/jmcorgan/fips`
+- **Stable pin (VPS1):** v0.4.0, commit `da2d0b7408fc98ffc17671b5a49a4d76ce504292`
+- **Android branch:** `ble-v2`, commit `56062094d604317a885e696f979c425518516cc1`
+- **Local fork:** ngit at `nostr://npub12m5exm2uk3xa674cc5r0hlyvccs5xxn7qv83ezuteefv5972nquq4j4szl/relay.ngit.dev/fips`
+- **Handshake:** Noise XK (initiator role for clients)
+- **Mesh discovery:** Nostr-based (kind 30078 events, app tag `fips-overlay-v1`)
 
-### Cashu Payment Gate (for internet access)
+### Repos
 
-The exit node uses a **Cashu payment gate** — users must pay to get internet egress:
+| Repo | URL | Contents |
+|------|-----|----------|
+| `fips-exit-node` | `github.com/OpenTollGate/fips-exit-node` | STATUS.md, README, ansible roles, SMOKE-1 tests, dashboard HTML |
+| `fips-exit-e2e` | `github.com/OpenTollGate/fips-exit-e2e` | Docker test harness, scripts, FIPS binaries, this handover doc |
+| `fips` (fork) | ngit relay.ngit.dev/fips | Upstream source + cherry-picked commits |
 
-```
-1. Android app generates a Cashu token (amount determines access duration)
-2. App sends token to fips-paygate on VPS1 (REST endpoint)
-3. Paygate validates token, adds phone's WG IP to nftables paid_peers set with timeout
-4. Internet access granted for time proportional to payment
-5. App must re-pay before timeout expires to maintain access
-```
+---
 
-**NFTables rule:**
-```
-nft add element inet fips-exit paid_peers { 10.99.99.X timeout Ns }
-```
+## 3. Architecture (Data Flow)
 
-The `paid_peers` set starts EMPTY. Without payment, the WG tunnel exists but MASQUERADE doesn't fire → no return traffic → no internet.
-
-**This is critical for the Android app:** you'll need a Cashu wallet integration or the ability to make Cashu payments.
-
-### WireGuard Integration
-
-FIPS doesn't directly provide internet egress — it's a mesh network protocol. The egress path is:
+### Internet Exit Path (via VPS1)
 
 ```
-FIPS mesh → fips0 TUN → kernel routing → wg0 WireGuard → nftables MASQUERADE → eth0 → internet
+[Android App: FIPS Client]
+       │
+       │  FIPS Mesh Protocol (UDP :2121 or TCP :8443)
+       │  Noise XK handshake → Encrypted session
+       │  (or BLE L2CAP to a nearby peer that relays to exit)
+       ▼
+[VPS1: FIPS Daemon v0.4.0]
+       │
+       │  Decapsulates → delivers to local fips0 TUN
+       ▼
+[Kernel IP Forward: fips0 → wg0]
+       │
+       ▼
+[WireGuard wg0 — 10.99.99.0/24 tunnel]
+       │
+       ▼
+[nftables fips-exit: MASQUERADE on eth0]
+       │
+       ▼
+[PUBLIC INTERNET]
 ```
 
-For Android, the architecture changes:
-```
-FIPS (inside VpnService) → fips0 TUN → Android routing → internet
-```
-
-OR if you keep the WireGuard exit model:
+### Android App Internal Architecture (ble-v2)
 
 ```
-FIPS mesh → wg0 (WireGuard tunnel to VPS1) → nftables MASQUERADE → internet
+┌─────────────────────────────────────────────┐
+│                  Android App                 │
+│                                              │
+│  ┌──────────┐   ┌─────────────────────────┐ │
+│  │ Kotlin UI │   │   VpnService (owns fd)   │ │
+│  │  (Compose)│   │         │                │ │
+│  └──────────┘   │  IPv6 packets ↔ channels │ │
+│                  └─────────┬───────────────┘ │
+│                            │                  │
+│                    JNI boundary               │
+│                            │                  │
+│  ┌─────────────────────────┴───────────────┐ │
+│  │         FIPS Rust Core (.so)              │ │
+│  │  ┌─────────────┐  ┌──────────────────┐  │ │
+│  │  │ Noise XK    │  │ Mesh routing     │  │ │
+│  │  │ handshake   │  │ (fd00::/8 ULA)   │  │ │
+│  │  └─────────────┘  └──────────────────┘  │ │
+│  │  ┌─────────────┐  ┌──────────────────┐  │ │
+│  │  │ UDP/TCP     │  │ BLE transport    │  │ │
+│  │  │ transport   │  │ (AndroidBleBridge)│  │ │
+│  │  └─────────────┘  └──────────────────┘  │ │
+│  └──────────────────────────────────────────┘ │
+└──────────────────────────────────────────────┘
+         │                           │
+    UDP/TCP :2121/:8443     BLE L2CAP CoC
+         │                           │
+         ▼                           ▼
+   [VPS1 Exit Node]          [Nearby FIPS Peer]
 ```
 
-The WireGuard tunnel (wg0) is on the VPS1 side, not the client side. The client just connects to FIPS mesh → traffic reaches VPS1 → gets routed through wg0 → out to internet. The Android app doesn't need WireGuard itself — it only needs FIPS.
+---
 
-### FIPS Config for Android (minimal)
+## 4. The ble-v2 Android API (The Key to Everything)
+
+### 4.1. App-Owned TUN Seam
+
+**`Node::enable_app_owned_tun()`** — THE critical API for Android.
+
+```rust
+// In your Rust FIPS embedder code (called from Kotlin via JNI):
+let (app_outbound_tx, app_inbound_rx) = node.enable_app_owned_tun();
+```
+
+What it does:
+- Returns `(TunOutboundTx, Receiver<Vec<u8>>)` — two channels
+- `app_outbound_tx`: push IPv6 packets FROM the app's TUN fd INTO FIPS (app → mesh)
+- `app_inbound_rx`: pull IPv6 packets FROM FIPS TO the app's TUN fd (mesh → app)
+- **Skips system-TUN creation entirely** — `start()` gates on `tun_tx` being unset
+- The embedder (Android VpnService) owns the fd, FIPS just exchanges bytes
+
+**Responsibilities of the embedder (your Kotlin code):**
+1. Read IPv6 packets from the VpnService fd
+2. Push them into `app_outbound_tx` via JNI
+3. Pull packets from `app_inbound_rx` via JNI
+4. Write them to the VpnService fd
+5. Push ONLY `fd::/8`-destined packets (FIPS doesn't filter anymore)
+6. Clamp TCP MSS on outbound SYNs
+
+Source: `src/node/mod.rs` line ~2878, `enable_app_owned_tun()` method.
+
+### 4.2. Android BLE Backend
+
+**`AndroidBleBridge`** — Kotlin BLE radio byte-bridge.
+
+```rust
+// In Rust (the FIPS library side):
+use crate::transport::ble::android_io::{set_android_ble_bridge, AndroidBleBridge, AndroidRadio};
+
+// Define the radio trait (Kotlin implements this via JNI):
+pub trait AndroidRadio: Send + Sync {
+    fn listen(&self) -> u16;                           // Open L2CAP listener, return PSM
+    fn connect(&self, connect_id: i64, addr: &BleAddr, psm: u16);
+    fn start_advertising(&self, psm: u16);
+    fn stop_advertising(&self);
+    fn start_scanning(&self);
+    fn stop_scanning(&self);
+    fn close_channel(&self, ch_id: i64);
+}
+
+// Create the bridge and inject it:
+let bridge = AndroidBleBridge::new(Arc::new(kotlin_radio_impl));
+set_android_ble_bridge(bridge);
+```
+
+The bridge uses a **byte-bridge pattern** (symmetric to nostr-vpn's MobileTunnel):
+- **Inbound** (Kotlin → Rust): pushed non-blocking into tokio channels
+- **Outbound** (Rust → Kotlin): pulled blocking-with-timeout by a Kotlin writer thread
+- The byte hot path NEVER calls JNI — `BleStream::send` only pushes into a std channel
+
+Source: `src/transport/ble/android_io.rs` (619 lines).
+
+### 4.3. Node Construction on Android
+
+When building a FIPS `Node` on Android (`target_os = "android"`):
+
+1. The Node constructor checks for an injected BLE bridge via `android_ble_bridge()`
+2. If present, it creates `AndroidIo` instances for BLE transport
+3. Desktop transports (UDP/TCP system TUN) are gated by `target_os` and excluded on Android
+4. The embedder calls `enable_app_owned_tun()` before `start()` to wire up VpnService
+
+### 4.4. BLE Performance (Empirical)
+
+From the source comments:
+- ~200 kbps upstream / ~500 kbps downstream over BLE L2CAP CoC
+- Outbound queue cap: 32 packets (empirically tuned)
+- MTU: 2048 bytes (L2CAP CoC default)
+- BLE variance (RF, 2M PHY, connection priority) rivals queue tuning effects
+
+BLE is for **nearby peer mesh** — NOT for internet exit. For internet exit, use UDP/TCP to VPS1.
+
+---
+
+## 5. What Works (Verified on VPS1)
+
+| Feature | Status | Evidence |
+|---------|--------|----------|
+| FIPS daemon start | ✅ | Raw Docker container starts cleanly |
+| UDP transport | ✅ | Connects to VPS1 :2121 |
+| TCP transport | ✅ | Config has TCP :8443 as fallback |
+| Noise XK handshake | ✅ | "Session established (initiator, XK)" logged |
+| Peer promotion | ✅ | "Connection promoted to active peer" confirmed |
+| Mesh parent switch | ✅ | "new_parent=vps1-exit" logged |
+| Encrypted session | ✅ | Full duplex after handshake |
+| E2E traffic | ✅ | nostr-vpn test proved egress (5 ICMP pkts) |
+| BLE transport | ✅ | ble-v2 branch, compiles for arm64-android |
+| App-owned TUN | ✅ | Unit tested (app_owned_tun_seam_wires_channels) |
+| Android BLE backend | ✅ | Cross-compiles clean for arm64-android |
+
+---
+
+## 6. What Did NOT Work / Lessons Learned
+
+### ❌ nvpn Test Peer Doesn't Reconnect
+The nostr-vpn 4.0.87 Docker image used as a test peer (EXIT-3) did **not** reconnect after VPS1 FIPS was restarted. We abandoned it in favor of a **raw FIPS Docker node**.
+
+**Lesson for Android:** Implement your own reconnect loop. Don't rely on any wrapper.
+
+### ❌ FIPS Has No Built-In Reconnect
+Neither v0.4.0 nor ble-v2 has automatic reconnection. The Android app needs **its own retry loop**: 5s → 10s → 20s → 40s → 60s, capped. Reset on successful handshake.
+
+### ❌ FIPS v0.5.0-dev (master) is Breaking
+Upstream master is mid-**sans-io refactor**. The config format and protocol behavior have changed. **DO NOT use master.** Use `ble-v2` branch (which is v0.4.0 + Android support).
+
+### ❌ nftables Not Available on Android
+The exit node uses nftables for MASQUERADE. The Android client does NOT need nftables — it's a **client**, not an exit.
+
+### ❌ Rust Cross-Compilation Requires Care
+FIPS Rust cross-compiles for `aarch64-linux-android` cleanly (ble-v2 verified). Use Android NDK + cargo targets. The `tun` crate dependency is gated by `cfg(unix)` and excluded on Android (app-owned TUN replaces it).
+
+### ❌ VPS1 FIPS Has No Rate Limiting (Yet)
+Phase 2 planned work includes per-npub rate limiting. Until then: one Android client can consume all available egress bandwidth. Don't stress-test without coordination.
+
+---
+
+## 7. How to Build the Android App
+
+### Recommended Architecture
+
+```
+android-app/
+├── app/                          # Android app module
+│   ├── src/main/
+│   │   ├── java/com/opentollgate/fips/
+│   │   │   ├── MainActivity.kt       # Compose UI
+│   │   │   ├── FipsVpnService.kt     # VpnService — owns TUN fd
+│   │   │   ├── BleRadio.kt           # Implements AndroidRadio trait via JNI
+│   │   │   └── NativeCore.kt         # JNI bindings to Rust .so
+│   │   ├── jniLibs/
+│   │   │   ├── arm64-v8a/libfips.so  # Cross-compiled FIPS
+│   │   │   ├── armeabi-v7a/libfips.so
+│   │   │   └── x86_64/libfips.so
+│   │   └── AndroidManifest.xml       # VPN permission, BLE permissions
+│   └── build.gradle.kts
+├── fips-embedder/                # Rust crate (JNI bridge)
+│   ├── src/
+│   │   ├── lib.rs                   # JNI exports (Java_..._NativeCore_*)
+│   │   ├── tun_bridge.rs            # VpnService ↔ FIPS channel glue
+│   │   └── ble_bridge.rs            # Kotlin BLE radio ↔ FIPS glue
+│   ├── Cargo.toml
+│   └── .cargo/config.toml           # NDK linker paths
+└── build.gradle.kts               # Root build file
+```
+
+### Step 1: Cross-Compile FIPS
+
+```bash
+# Clone ble-v2
+git clone https://github.com/jmcorgan/fips.git
+cd fips
+git checkout ble-v2
+
+# Add Android targets
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+
+# Set up NDK (install via Android Studio SDK Manager)
+export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/27.0.12077973
+
+# Create .cargo/config.toml with NDK linker paths:
+# [target.aarch64-linux-android]
+# linker = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+
+# Build (ble-v2 cross-compiles clean)
+cargo build --target aarch64-linux-android --release
+```
+
+### Step 2: Write the JNI Embedder
+
+The embedder crate (`fips-embedder`) bridges Kotlin ↔ Rust:
+
+```rust
+// fips-embedder/src/lib.rs
+use jni::JNIEnv;
+use jni::objects::{JClass, JObject, JString};
+use jni::sys::{jbyteArray, jlong, jshort};
+
+#[no_mangle]
+pub extern "system" fn Java_com_opentollgate_fips_NativeCore_start(
+    mut env: JNIEnv, _class: JClass, config_yaml: JString, tun_fd: jlong
+) {
+    // 1. Parse config
+    // 2. Create Node::new(config)
+    // 3. Call node.enable_app_owned_tun() → get channels
+    // 4. Spawn tokio task: read from tun_fd → push to app_outbound_tx
+    // 5. Spawn tokio task: pull from app_inbound_rx → write to tun_fd
+    // 6. node.start().await
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_opentollgate_fips_NativeCore_setBleBridge(
+    mut env: JNIEnv, _class: JClass, radio: JObject
+) {
+    // Wrap the Kotlin BleRadio object in an AndroidRadio impl
+    // Create AndroidBleBridge, inject via set_android_ble_bridge()
+}
+```
+
+### Step 3: Write the VpnService
+
+```kotlin
+// FipsVpnService.kt
+class FipsVpnService : VpnService() {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val builder = Builder()
+        builder.setSession("FIPS Mesh")
+        builder.addAddress("fd00::1", 64)  // FIPS IPv6 ULA
+        builder.addRoute("fd00::", 8)       // Route mesh traffic
+        val establish = builder.establish() // Returns ParcelFileDescriptor (the fd)
+        val fd = establish!!.fd.toLong()
+
+        // Pass fd to Rust via JNI
+        NativeCore.start(configYaml, fd)
+        return START_STICKY
+    }
+}
+```
+
+### Step 4: Write the BLE Radio (Optional — for BLE mesh)
+
+```kotlin
+// BleRadio.kt — implements the AndroidRadio trait
+class BleRadio : BluetoothAdapter, AndroidRadio {
+    override fun listen(): Short {
+        // Open BluetoothServerSocket with L2CAP, return PSM
+    }
+    override fun connect(connectId: Long, addr: BleAddr, psm: Short) {
+        // BluetoothSocket connect to peer
+    }
+    override fun startAdvertising(psm: Short) { ... }
+    override fun startScanning() { ... }
+    // ... etc
+}
+```
+
+---
+
+## 8. FIPS Config for Android Client
 
 ```yaml
+# Client-side FIPS config (generated by the app or shipped as a template)
 node:
   identity:
-    nsec: "nsec1..."  # generated per-install, stored in Keystore
+    nsec: "<generated-or-imported-client-nsec>"
   discovery:
     nostr:
       enabled: true
       policy: configured_only
       app: "fips-overlay-v1"
-      advertise: false
+      advertise: false           # Phone should NOT advertise as exit
 
 tun:
   enabled: true
+  # On Android with enable_app_owned_tun(), FIPS skips system-TUN creation.
+  # The VpnService owns the fd. These fields are informational.
   name: fips0
   mtu: 1280
 
-transports:
-  udp:
-    bind_addr: "0.0.0.0:2121"
-    advertise_on_nostr: false
-  tcp:
-    bind_addr: "0.0.0.0:8443"
-    advertise_on_nostr: false
+# On Android, UDP/TCP transports are gated out by target_os.
+# The app must connect via the mesh (BLE to a peer, or custom transport).
+# For direct internet exit, the app can define a custom UDP transport.
 
+# BLE transport (optional — for nearby peer mesh)
+transports:
+  ble:
+    enabled: true
+    mtu: 2048
+
+# Static peer config to reach the exit node
 peers:
   - npub: "npub1mqelkzqp4659fws35h2wvr7z9caka5ml8qddj3ssnwaulwpxdd9sdc3esw"
     alias: "vps1-exit"
@@ -248,152 +418,122 @@ peers:
     connect_policy: auto_connect
 ```
 
+**Note:** On Android with `target_os = "android"`, the standard UDP/TCP transports are gated out. You have two options for reaching the exit node:
+1. **BLE relay:** Connect via BLE to a nearby peer that relays to the exit node
+2. **Custom UDP transport:** Write your own transport impl that uses Android sockets (Java `DatagramSocket` via JNI, similar to the BLE byte-bridge pattern)
+
+Option 2 is needed for direct phone-to-VPS1 exit connectivity.
+
 ---
 
-## 5. VPS1 Connection Details (for testing)
+## 9. Key Test Vectors
 
-| Property | Value |
-|----------|-------|
-| IP | 66.92.204.38 |
-| FIPS UDP port | 2121 |
-| FIPS TCP port | 8443 |
-| SSH user | debian |
-| OS | Debian 13 |
-| FIPS daemon user | systemd service (fips.service) |
-| FIPS config | /etc/fips/fips.yaml |
-| FIPS binary | /usr/bin/fips (17.6MB, v0.4.0-derivative) |
-| WireGuard port | 51821 (UDP) |
-| WG subnet | 10.99.99.0/24 (VPS1=10.99.99.1) |
-| VPS1 npub | npub1mqelkzqp4659fws35h2wvr7z9caka5ml8qddj3ssnwaulwpxdd9sdc3esw |
-| Domain | fips-exit.orangesync.tech |
-| Dashboard | nsite gateway on port 3002 (only routes `*.nsite.orangesync.tech`) |
+| Parameter | Value |
+|-----------|-------|
+| Exit node IP | `66.92.204.38` |
+| FIPS port (UDP) | `2121` |
+| FIPS port (TCP) | `8443` |
+| Exit node npub | `npub1mqelkzqp4659fws35h2wvr7z9caka5ml8qddj3ssnwaulwpxdd9sdc3esw` |
+| App tag | `fips-overlay-v1` |
+| Handshake type | `Noise XK` (initiator role) |
+| TUN MTU | `1280` |
+| Expected log | `"Connection promoted to active peer"` |
+| Expected log | `"Session established (initiator, XK)"` |
+| Expected log | `"new_parent=vps1-exit"` |
+| BLE throughput | ~200/500 kbps up/down |
+| BLE MTU | 2048 bytes |
 
-**Test peer npub (for reference):** npub1569mpl… (generated, can be regenerated)
+---
 
-**To verify VPS1 is running:**
-```bash
-# Check FIPS daemon
-ssh debian@66.92.204.38 'sudo systemctl status fips --no-pager'
+## 10. What NOT To Do
 
-# Check WireGuard
-ssh debian@66.92.204.38 'sudo wg show wg0'
+- ❌ **Don't use FIPS master.** Use `ble-v2` branch. Master is mid-sans-io-refactor.
+- ❌ **Don't use nvpn.** It breaks on reconnect. Go raw FIPS protocol.
+- ❌ **Don't hardcode secrets.** Use Android KeyStore for nsec.
+- ❌ **Don't assume the exit node has infinite bandwidth.** This is a PoC on a shared VPS.
+- ❌ **Don't require root.** Use `VpnService` API (no root needed).
+- ❌ **Don't ignore reconnection.** The exit node may restart for updates.
+- ❌ **Don't create a system TUN on Android.** Use `enable_app_owned_tun()` — the VpnService owns the fd.
+- ❌ **Don't push non-fd::/8 packets through the TUN seam.** FIPS no longer filters them.
 
-# Check nftables rules
-ssh debian@66.92.204.38 'sudo nft list table inet fips-exit'
+---
 
-# Check FIPS config
-ssh debian@66.92.204.38 'sudo cat /etc/fips/fips.yaml'
+## 11. Key Source Files in ble-v2
+
+| File | What It Does |
+|------|-------------|
+| `src/node/mod.rs` (line ~2878) | `enable_app_owned_tun()` — the TUN seam API |
+| `src/node/mod.rs` (line ~1048) | Android BLE transport construction (`cfg(target_os = "android")`) |
+| `src/transport/ble/android_io.rs` | Full Android BLE backend (619 lines) — AndroidRadio, AndroidBleBridge, AndroidIo/Stream/Acceptor/Scanner |
+| `src/transport/ble/mod.rs` | BLE transport module, wires AndroidIo as DefaultBleTransport on Android |
+| `src/transport/ble/psm.rs` | Per-peer PSM discovery (L2CAP port mapping) |
+| `src/transport/ble/io.rs` | BleIo trait (transport abstraction) |
+| `src/transport/ble/discovery.rs` | BLE peer discovery |
+| `docs/design/fips-ipv6-adapter.md` | IPv6 adapter design — fd00::/8 ULA addressing, DNS `.fips` resolution |
+| `src/upper/tun.rs` | TUN device management (skipped on Android with app-owned TUN) |
+| `Cargo.toml` | Platform-gated dependencies (tun crate is `cfg(unix)` but excluded via app-owned path) |
+| `testing/ble/ble_spike.rs` | BLE L2CAP spike test (validates API assumptions) |
+
+### ble-v2 commits (11 on top of v0.4.0)
+
+```
+5606209 fix(ble): reframe inbound L2CAP stream so packets survive non-SeqPacket backends
+095c119 style(ble): rustfmt android_io and psm
+0a56f7e docs: list Android as a supported platform
+eea5c4f perf(ble): shallow, backpressured outbound queue to fix bufferbloat
+6094aa5 fix(ble): dial the last-learned PSM on a per-peer lookup miss
+618d1e6 feat(node): app-owned TUN seam — embedder owns the fd, FIPS uses channels
+f872c0b feat(ble): record scan adverts (PSM + RSSI) for the developer UI
+b517458 fix(ble): safe AndroidBleBridge teardown + replaceable injection
+4695ffd feat(ble): public peer-view read API for embedders running run_rx_loop
+2204894 feat(ble): AndroidBleBridge::channel_open — let next_send tell closed from timeout
+d5f8921 feat(ble): Android backend — BleIo over a Kotlin-radio byte-bridge
+908bc48 feat(ble): per-peer PSM discovery core + compile BLE on macOS/Android
+a879fdb feat(mobile): gate desktop transports/TUN by target_os, not features
 ```
 
-**Password for SSH:** stored in `tollgate-infrastructure-kit/.env` as `VPS_PASSWORD`.
+All by **Origami74 (Arjen)** — `@1624e1bb-94ef-46d1-b03b-f067ea320af9` on Signal.
 
 ---
 
-## 6. What You Need to Build
+## 12. Reference: The Embedder Pattern
 
-### Android App
+The FIPS source comments reference **`myco-core`** — Origami74's Android embedder crate that implements the JNI layer. This is NOT in the FIPS tree. Contact Origami74 for access to myco-core, which is the working reference implementation of:
 
-The app should:
-1. **Generate Nostr keypair** on first launch (or let user import existing)
-2. **Run FIPS v0.4.0** as a background service (using VpnService API or JNI)
-3. **Connect to VPS1** FIPS exit node (configured static peer)
-4. **Handle mesh handshake** — wait for "Session established" log
-5. **Route device traffic** through FIPS mesh → VPS1 exit → internet
-6. **Handle Cashu payment** — pay the VPS1 paygate for internet access
-7. **Show status dashboard** — connected/disconnected, traffic stats, payment timer
-8. **Auto-reconnect** — handle disconnections gracefully
-9. **Playwright test** — create a smoke test and record video of the happy path
+- `Java_..._NativeCore_*` JNI exports
+- `AndroidRadio` trait implementation via JNI `call_method` on a Kotlin `BleRadio` object
+- The Kotlin BLE radio (scan, advertise, L2CAP listen/connect, socket read/write)
+- The VpnService ↔ FIPS TUN channel glue
 
-### Playwright Smoke Test
-
-Since this is Android, you'll need either:
-- **Appium** with WebDriverIO for Android app testing
-- OR **Detox** (React Native testing library)
-- OR a simple HTTP endpoint test if the app exposes a local status API
-
-The test should capture:
-1. App launches, shows status UI
-2. FIPS connects to VPS1, shows "connected"
-3. Payment flow initiates
-4. Internet egress verified (fetch a known URL successfully)
-5. Disconnect gracefully
-
-**Record video** of the full happy path and submit it as evidence before marking the task as ready for review.
+**myco-core is the fastest path to a working Android app.** It already works with ble-v2. Fork it and customize the UI for the exit-node use case.
 
 ---
 
-## 7. Cron Jobs & Monitoring
+## 13. Contacts
 
-| Job | Schedule | What it does |
-|-----|----------|--------------|
-| FIPS VPS1 Health | Every 15 min | Checks FIPS daemon, ports, WG tunnel, error storms |
-| fips-exit-smoke-daily | Daily 06:00 | Runs SMOKE-1 tests against VPS1 |
-| FIPS AI Fallback | Every 4h | LLM-driven analysis & recommendations |
-
-All cron jobs are **anomaly-only** — silent when healthy. They deliver to the `fips-exit-node-poc` Signal group on issues.
+- **c08r4d0r** — project owner (Signal @+181****0908)
+- **Origami74 (Arjen)** — ble-v2 author, has working Android embedder (myco-core)
+- **jmcorgan** — FIPS upstream maintainer (johnathan@corganlabs.com)
+- **Amperstrand** — collaborator, conwrt UseCase patterns
+- **Relay operators** — relay1.orangesync.tech, ngit1.orangesync.tech
 
 ---
 
-## 8. What We Learned
+## 14. Quick Start Checklist
 
-### FIPS is stable but evolving
-- v0.4.0 is production-stable for basic mesh connectivity
-- The Noise XK handshake is reliable (never seen a failure)
-- Session re-establishment after disconnect works (peer sends "Shutdown" notification, then reconnects)
-- The TCP fallback transport is useful but UDP is preferred (lower latency)
-
-### Config gotchas
-- `tun/dns/transports` at **root level**, not under `node:` — this caught us out
-- `external_addr` is a property of `transports.tcp`, not a top-level config
-- `advertise_on_nostr: true` without `external_addr` set generates a persistent warning log (but doesn't break anything)
-- `--network host` is required for Docker — the TUN device and port binding don't work in bridge mode
-
-### WireGuard + nftables works but needs attention
-- The `paid_peers` set is the gate — without it, no internet even with a working tunnel
-- The Cashu payment gate was integrated but not fully e2e tested
-- WireGuard handshake stays alive indefinitely as long as there's traffic
-
-### Things we didn't finish
-- **Playwright tests** — config exists, no test files written yet
-- **Dashboard at fips-exit.orangesync.tech** — domain resolves but nsite gateway only handles `*.nsite.orangesync.tech` subdomain pattern, so the custom domain may not work without Caddy config changes
-- **GitHub Actions CI** — planned but not implemented
-- **Multi-peer support** — only tested with one peer at a time
-- **Graceful reconnect after VPS1 FIPS restart** — the raw FIPS Docker node handles this but we never stress-tested it
-- **Rate limiting** — per-npub traffic caps are planned but not implemented
-
-### The Android-specific challenge
-FIPS's TUN creation is tightly coupled to the daemon's startup. Android's VpnService API provides a TUN file descriptor that must be created by the Android framework, then handed to the routing layer. The FIPS Rust code will need modification to accept a pre-opened fd instead of creating its own `/dev/net/tun` device. This is the **single hardest part** of the Android port.
+1. [ ] Contact Origami74 for `myco-core` access (the working Android embedder)
+2. [ ] Clone `jmcorgan/fips`, checkout `ble-v2` branch
+3. [ ] Install Android NDK + Rust Android targets
+4. [ ] Cross-compile FIPS: `cargo build --target aarch64-linux-android --release`
+5. [ ] Fork myco-core, customize UI for exit-node use case
+6. [ ] Add exit node config: npub `npub1mqelkzqp4659fws35h2wvr7z9caka5ml8qddj3ssnwaulwpxdd9sdc3esw`, addr `66.92.204.38:2121`
+7. [ ] Test Noise XK handshake to VPS1 (watch for "Connection promoted to active peer")
+8. [ ] Test VpnService TUN routing (internet traffic through mesh)
+9. [ ] Implement reconnect loop (5s → 60s backoff)
+10. [ ] Add per-app VPN toggle
+11. [ ] Add BLE peer scan UI (optional)
+12. [ ] Playwright/Espresso happy-path tests with video evidence
 
 ---
 
-## 9. Key Files & Paths
-
-| Resource | Path |
-|----------|------|
-| fips-exit-e2e repo | `~/repos/fips-exit-e2e/` (also: `github.com/OpenTollGate/fips-exit-e2e`) |
-| FIPS upstream | `~/fips/` (v0.4.0 tag, commit `da2d0b74b05d7a2bafd67e05fcf7a6edf9afa5d7`) |
-| Docker entrypoint | `docker/entrypoint.sh` — env-var → fips.yaml generator |
-| Dockerfile | `docker/Dockerfile.fips-node` — debian:trixie-slim runtime |
-| Compose | `docker-compose.yml` — fips-node + probe topology |
-| FIPS pin doc | `fips-pin.txt` — version pin policy |
-| Architecture doc | `docs/STATUS-AND-DESIGN.md` |
-| Plan | `docs/PLAN.md` |
-| Playwright config | `playwright.config.mjs` |
-| VPS1 FIPS config | `/etc/fips/fips.yaml` (remote, on VPS1) |
-| VPS1 systemd unit | `/usr/lib/systemd/system/fips.service` (remote) |
-| VPS1 nftables | `/opt/tollgate/fips-exit-node/exit-nat.nft` (remote) |
-| VPS1 WG config | `/etc/wireguard/wg0.conf` (remote) |
-| SMOKE-1 tests | In the tollgate-infrastructure-kit repo (separate from fips-exit-e2e) |
-
----
-
-## 10. Contact
-
-- **c08r4d0r** — project owner, Signal @+18102940908
-- **Amperstrand** — contributor (@1624e1bb-94ef-46d1-b03b-f067ea320af9)
-- **Upstream FIPS maintainer:** Johnathan Corgan (johnathan@corganlabs.com)
-- **Relays:** relay1.orangesync.tech, ngit1.orangesync.tech, relay.damus.io, nos.lol
-
----
-
-*Good luck with the Android port. Remember: **Done means pushed.** Commit early, push often, and show video evidence of the happy path before surfacing for review.*
+*Generated 2026-07-06. Last known good state: Phase 1 complete, FIPS v0.4.0 pinned on VPS1, ble-v2 branch has Android support.*
