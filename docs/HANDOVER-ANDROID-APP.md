@@ -394,19 +394,21 @@ node:
 tun:
   enabled: true
   # On Android with enable_app_owned_tun(), FIPS skips system-TUN creation.
-  # The VpnService owns the fd. These fields are informational.
+  # The VpnService owns the fd. These fields are informational only.
   name: fips0
   mtu: 1280
 
-# On Android, UDP/TCP transports are gated out by target_os.
-# The app must connect via the mesh (BLE to a peer, or custom transport).
-# For direct internet exit, the app can define a custom UDP transport.
-
-# BLE transport (optional — for nearby peer mesh)
+# UDP and TCP BOTH work on Android. Only Ethernet is gated out (needs raw sockets).
 transports:
-  ble:
-    enabled: true
-    mtu: 2048
+  udp:
+    bind_addr: "0.0.0.0:2121"
+    advertise_on_nostr: false
+  tcp:
+    bind_addr: "0.0.0.0:8443"
+    advertise_on_nostr: false
+  # BLE transport (optional — for nearby peer mesh, not needed for exit node)
+  # ble:
+  #   enabled: true
 
 # Static peer config to reach the exit node
 peers:
@@ -418,11 +420,16 @@ peers:
     connect_policy: auto_connect
 ```
 
-**Note:** On Android with `target_os = "android"`, the standard UDP/TCP transports are gated out. You have two options for reaching the exit node:
-1. **BLE relay:** Connect via BLE to a nearby peer that relays to the exit node
-2. **Custom UDP transport:** Write your own transport impl that uses Android sockets (Java `DatagramSocket` via JNI, similar to the BLE byte-bridge pattern)
+**Transport availability on Android (from ble-v2 README):**
 
-Option 2 is needed for direct phone-to-VPS1 exit connectivity.
+| Transport | Android |
+|-----------|:-------:|
+| UDP       |   ✅    |
+| TCP       |   ✅    |
+| Ethernet  |   ❌    |
+| BLE       |   ✅    |
+
+The app connects to VPS1 exit directly via UDP/TCP. No relay needed. BLE is a bonus for peer-to-peer mesh.
 
 ---
 
@@ -537,3 +544,185 @@ The FIPS source comments reference **`myco-core`** — Origami74's Android embed
 ---
 
 *Generated 2026-07-06. Last known good state: Phase 1 complete, FIPS v0.4.0 pinned on VPS1, ble-v2 branch has Android support.*
+
+---
+
+## Appendix A: Integration Pointers for the LLM
+
+### The Exact API Surface (from ble-v2 source)
+
+The Node lifecycle an Android embedder uses:
+
+```rust
+// 1. Create node from config
+let mut node = Node::new(config)?;
+
+// 2. Set up app-owned TUN (before start!)
+let (app_outbound_tx, app_inbound_rx) = node.enable_app_owned_tun();
+//    app_outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>  (app → mesh)
+//    app_inbound_rx:  std::sync::mpsc::Receiver<Vec<u8>>  (mesh → app)
+
+// 3. Get a control read handle for UI polling (before moving node to bg task)
+let control_handle = node.control_read_handle();
+
+// 4. Start transports + handshake
+node.start().await?;
+//    start() skips TunDevice::create because tun_tx is set (gated by `self.tun_tx.is_none()`)
+
+// 5. Run the RX event loop on a background task
+//    This is what processes incoming packets, handshakes, routing
+tokio::spawn(async move {
+    node.run_rx_loop().await
+});
+
+// Meanwhile, on the VpnService fd thread:
+//    loop {
+//        let pkt = read_from_fd(tun_fd);   // app reads from VpnService TUN
+//        app_outbound_tx.try_send(pkt);     // push to FIPS (app → mesh)
+//
+//        if let Ok(mesh_pkt) = app_inbound_rx.recv_timeout(Duration::from_millis(50)) {
+//            write_to_fd(tun_fd, &mesh_pkt); // mesh → app → fd
+//        }
+//    }
+
+// 6. To stop:
+node.stop().await?;
+//    stop() drops the packet channel, run_rx_loop exits
+```
+
+### Channel Types (IMPORTANT mismatch)
+
+The two channels use **different** channel implementations — this is intentional:
+
+| Direction | Channel type | Why |
+|-----------|-------------|-----|
+| app → mesh | `tokio::sync::mpsc::Sender<Vec<u8>>` | FIPS drains this in `run_rx_loop` (async context) |
+| mesh → app | `std::sync::mpsc::Receiver<Vec<u8>>` | App reads from a blocking JNI thread, not async |
+
+When reading from `app_inbound_rx`, use `recv_timeout` (not blocking `recv`) so the JNI thread can check a shutdown flag between polls.
+
+### ControlReadHandle — Polling Peer State from UI
+
+```rust
+// src/control/read_handle.rs
+pub struct PeerView {
+    pub node_addr_hex: String,
+    pub npub: String,
+    pub connected: bool,
+}
+
+// Call from any thread — uses ArcSwap (lock-free read)
+let views: Vec<PeerView> = control_handle.peer_views();
+```
+
+This is how the Android app's status UI reads "connected peers" without touching the Node (which is borrowed by `run_rx_loop` on the background task).
+
+### BLE Bridge JNI Surface (if using BLE transport)
+
+If you implement BLE peer-to-peer, here's the Kotlin ↔ Rust bridge:
+
+**Rust side (already in FIPS):**
+```rust
+// src/transport/ble/android_io.rs
+
+// The trait Kotlin must implement via JNI:
+pub trait AndroidRadio: Send + Sync {
+    fn listen(&self) -> u16;                                    // returns PSM
+    fn connect(&self, connect_id: i64, addr: &BleAddr, psm: u16);
+    fn start_advertising(&self, psm: u16);
+    fn stop_advertising(&self);
+    fn start_scanning(&self);
+    fn stop_scanning(&self);
+    fn close_channel(&self, ch_id: i64);
+}
+
+// Injection (call before Node::start):
+pub fn set_android_ble_bridge(bridge: Arc<AndroidBleBridge>)
+
+// JNI-facing methods (Kotlin calls these via JNI exports):
+impl AndroidBleBridge {
+    pub fn new(radio: Arc<dyn AndroidRadio>) -> Arc<Self>
+    pub fn deliver_inbound(&self, remote: BleAddr, send_mtu: u16, recv_mtu: u16) -> i64
+    pub fn deliver_connect_result(&self, connect_id: i64, ok: bool, ...) -> i64
+    pub fn deliver_scan(&self, addr: BleAddr, psm: u16, rssi: i32)
+    pub fn deliver_recv(&self, ch_id: i64, data: &[u8]) -> bool
+    pub fn next_send(&self, ch_id: i64, timeout: Duration) -> Option<Vec<u8>>
+    pub fn channel_open(&self, ch_id: i64) -> bool
+}
+```
+
+**Kotlin side (you write this):**
+- `BleRadio` class implementing the radio operations
+- JNI `Java_..._NativeCore_*` exports that call `deliver_*` / `next_send`
+- Per-channel writer threads pulling via `next_send` (blocking with timeout)
+- `BluetoothLeScanner` / `BluetoothLeAdvertiser` / L2CAP socket management
+
+### Cross-Compilation Notes
+
+```bash
+# Install Rust Android targets
+rustup target add aarch64-linux-android armv7-linux-androideabi
+
+# In ~/.cargo/config.toml:
+# [target.aarch64-linux-android]
+# linker = "/path/to/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+
+# Build (no special flags needed — build.rs auto-detects target_os=android)
+cargo build --target aarch64-linux-android --release -p fips
+```
+
+**Watch out for:**
+- `ring = "0.17"` — crypto crate with C/assembly. Needs NDK C compiler. May need `RING_*` env vars pointing to NDK toolchain.
+- `tun = "0.8.7"` — gated `cfg(unix)` but Android is unix. However, with `enable_app_owned_tun()`, the TUN creation path is **skipped** so this dependency is effectively unused at runtime. It still needs to compile though.
+- `socket2`, `tokio` — work fine on Android, pure Rust or have Android support.
+- `nostr-sdk = "0.44"` — check for Android TLS backend. May need `--features rustls-tls` instead of native-tls.
+
+### Build.rs CFG Gates (automatic)
+
+The `build.rs` script auto-detects the target and sets these cfg flags:
+
+```
+target_os = "android" → ble_available (BLE module compiles)
+target_os = "android" → DefaultBleTransport = BleTransport<AndroidIo>
+target_os = "android" → system-tun = no-op stub (all functions return Ok(()))
+target_os = "android" → Ethernet transport excluded
+```
+
+You do NOT need to pass any `--features` or `--no-default-features`. A plain `cargo build --target aarch64-linux-android` compiles correctly.
+
+### Embedder Contract Summary (MUST FOLLOW)
+
+When using `enable_app_owned_tun()`, the app owns three responsibilities that the system-TUN reader would normally handle:
+
+1. **Filter destinations:** Push only `fd00::/8`-destined IPv6 packets to `app_outbound_tx`. FIPS does NOT filter in app-owned mode. Non-fd00::/8 packets will be misrouted.
+
+2. **Clamp TCP MSS:** On outbound SYNs, clamp the TCP Maximum Segment Size to fit within the TUN MTU. Without this, cold TCP connections can wedge (silent drops, no PTB feedback through userspace TUN).
+
+3. **Use recv_timeout:** When pulling from `app_inbound_rx`, use `recv_timeout(Duration)` not blocking `recv()`. This lets the JNI thread check a shutdown flag between polls for clean service teardown.
+
+### The myco-core Reference
+
+FIPS source comments reference **`myco-core`** — Origami74's Android embedder crate. This is the working reference implementation of:
+- `Java_..._NativeCore_*` JNI exports
+- `AndroidRadio` trait implementation via JNI
+- Kotlin BLE radio (scan, advertise, L2CAP, sockets)
+- VpnService ↔ FIPS TUN channel glue
+
+**myco-core is NOT in the FIPS repo.** Contact Origami74 (Arjen, `@1624e1bb-94ef-46d1-b03b-f067ea320af9` on Signal) for access. It already works with ble-v2 — fork it and customize the UI.
+
+### Test Vectors
+
+| Parameter | Value |
+|-----------|-------|
+| Exit node IP | `66.92.204.38` |
+| FIPS port (UDP) | `2121` |
+| FIPS port (TCP) | `8443` |
+| Exit node npub | `npub1mqelkzqp4659fws35h2wvr7z9caka5ml8qddj3ssnwaulwpxdd9sdc3esw` |
+| App tag | `fips-overlay-v1` |
+| Handshake type | `Noise XK` (phone is initiator) |
+| TUN MTU | `1280` |
+| Expected log on success | `Connection promoted to active peer peer=vps1-exit` |
+| Expected log on success | `Session established (initiator, XK)` |
+| Expected log on success | `new_parent=vps1-exit` |
+| BLE throughput (if used) | ~200/500 kbps up/down |
+| BLE outbound queue depth | 32 (empirically tuned) |
