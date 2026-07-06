@@ -3,7 +3,8 @@
 **Decisions made (from c08r4d0r):**
 - ✅ **Repo:** `github.com/OpenTollGate/fips-exit-e2e`
 - ✅ **Budget:** Use existing VPS (tollgate-infrastructure-kit), no new spend
-- ✅ **FIPS version:** Pin working rev (30c5808e09-dirty), don't follow master
+- ✅ **FIPS version:** v0.4.0 release (pre-refactor, rev d5ee526), pinned
+- ✅ **Testing:** Playwright video for every happy-path before sign-off
 - ✅ **Domain:** `fips-exit.orangesync.tech` via nsite
 - ✅ **Test freq:** Daily cron + per-push CI
 - ✅ **Publishing:** All work to ngit
