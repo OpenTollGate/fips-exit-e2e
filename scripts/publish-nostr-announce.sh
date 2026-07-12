@@ -25,7 +25,7 @@ RELAYS="${FIPS_RELAYS:-wss://relay1.orangesync.tech wss://nos.lol}"
 EXIT_ADDR="${FIPS_EXIT_ADDR:-66.92.204.38}"
 EXIT_UDP_PORT="${FIPS_EXIT_UDP_PORT:-2121}"
 EXIT_TCP_PORT="${FIPS_EXIT_TCP_PORT:-8443}"
-EXIT_NPUB="${FIPS_EXIT_NPUB:-npub1mqelkzqp4659fws35h2wvr7z9caka5ml8qddj3ssnwaulwpxdd9sdc3esw}"
+EXIT_NPUB="${FIPS_EXIT_NPUB:-npub1569mplttzhmxuxxktduj8uwsn0g77ky3c34598sxclpjxkfndfksm4p6gp}"
 
 # --- Get the nsec ---
 if [ -n "${FIPS_NSEC:-}" ]; then
